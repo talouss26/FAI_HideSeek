@@ -15,60 +15,133 @@ from environment import Move
 
 class PacmanAgent(BasePacmanAgent):
     """
-    Pacman (Seek Agent): Chỉ sử dụng thuật toán BFS để tìm đường đi ngắn nhất 
-    đến vị trí của Ghost nhằm bắt mục tiêu nhanh nhất.
+    Pacman (Seek Agent): Sử dụng thuật toán Minimax với cắt tỉa Alpha-Beta.
+    Mục tiêu: Đánh giá trước các bước di chuyển, thu hẹp khoảng cách với Ghost 
+    và dồn Ghost vào các vị trí ít đường lui (góc chết/ngõ cụt).
     """
     
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.name = "BFS_Seeker_Pacman"
-        # Tốc độ tối đa của Pacman khi đi thẳng [cite: 73, 82]
+        self.name = "AlphaBeta_Seeker_Pacman"
+        # Tốc độ tối đa của Pacman khi đi thẳng (Mặc định: 2)
         self.pacman_speed = max(1, int(kwargs.get("pacman_speed", 2)))
         self.last_known_enemy_pos = None
+        # Độ sâu của cây Minimax (Giới hạn ở mức 3 hoặc 4 để đảm bảo phản hồi dưới 1 giây)
+        self.search_depth = 3
     
     def _is_valid_position(self, pos: tuple, map_state: np.ndarray) -> bool:
         row, col = pos
         height, width = map_state.shape
         return 0 <= row < height and 0 <= col < width and map_state[row, col] == 0
 
-    def _bfs_shortest_path(self, start: tuple, goal: tuple, map_state: np.ndarray):
-        """Tìm hướng đi đầu tiên (Move) trên đường đi ngắn nhất từ start đến goal bằng BFS."""
-        if start == goal:
-            return None
-            
-        queue = deque([(start, None)])  # (vị trí hiện tại, hướng đi đầu tiên)
-        visited = {start}
-        
-        while queue:
-            curr_pos, first_move = queue.popleft()
-            
-            if curr_pos == goal:
-                return first_move
+    def _get_pacman_moves(self, pos: tuple, map_state: np.ndarray):
+        """
+        Lấy danh sách các nước đi hợp lệ của Pacman.
+        Tận dụng lợi thế đi thẳng tối đa số ô cho phép (không rẽ chữ L).
+        """
+        moves = []
+        for m in [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT]:
+            dr, dc = m.value
+            for steps in range(1, self.pacman_speed + 1):
+                # Đảm bảo toàn bộ các ô trên đường đi thẳng đều không có tường
+                valid_straight_line = True
+                for i in range(1, steps + 1):
+                    inter_pos = (pos[0] + dr * i, pos[1] + dc * i)
+                    if not self._is_valid_position(inter_pos, map_state):
+                        valid_straight_line = False
+                        break
                 
-            # Duyệt các hướng di chuyển có thể
-            for move in [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT]:
-                dr, dc = move.value
-                nxt_pos = (curr_pos[0] + dr, curr_pos[1] + dc)
-                
-                if self._is_valid_position(nxt_pos, map_state) and nxt_pos not in visited:
-                    visited.add(nxt_pos)
-                    # Nếu chưa có hướng đi đầu tiên (nút kề gốc), gán bằng move hiện tại
-                    nxt_first_move = first_move if first_move is not None else move
-                    queue.append((nxt_pos, nxt_first_move))
-        return None
+                if valid_straight_line:
+                    moves.append((m, steps))
+                    
+        if not moves:
+            moves.append((Move.STAY, 1))
+        return moves
 
-    def _max_valid_steps(self, pos: tuple, move: Move, map_state: np.ndarray, max_steps: int) -> int:
-        """Tính số bước đi thẳng tối đa mà không đâm vào tường[cite: 82]."""
-        steps = 0
-        current = pos
-        for _ in range(max_steps):
-            dr, dc = move.value
-            next_pos = (current[0] + dr, current[1] + dc)
-            if not self._is_valid_position(next_pos, map_state):
-                break
-            steps += 1
-            current = next_pos
-        return steps
+    def _get_ghost_moves(self, pos: tuple, map_state: np.ndarray):
+        """Lấy danh sách các nước đi hợp lệ của Ghost (1 bước)."""
+        moves = [Move.STAY]
+        for m in [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT]:
+            dr, dc = m.value
+            nxt_pos = (pos[0] + dr, pos[1] + dc)
+            if self._is_valid_position(nxt_pos, map_state):
+                moves.append(m)
+        return moves
+
+    def _manhattan_distance(self, pos1: tuple, pos2: tuple) -> int:
+        return abs(pos1[0] - pos2[0]) + abs(pos1[1] - pos2[1])
+
+    def _evaluation_function(self, pacman_pos: tuple, ghost_pos: tuple, map_state: np.ndarray) -> float:
+        """
+        Hàm đánh giá điểm của một trạng thái.
+        Điểm cao (Pacman ưu tiên) khi: Khoảng cách ngắn + Ghost bị dồn vào ngõ cụt.
+        """
+        dist = self._manhattan_distance(pacman_pos, ghost_pos)
+        
+        # Nếu khoảng cách < 2, Pacman đã bắt được Ghost (Điều kiện thắng) -> Điểm tuyệt đối
+        if dist < 2:
+            return 999999.0
+            
+        # Trừ điểm dựa trên khoảng cách (khoảng cách càng xa điểm càng âm)
+        score = -dist * 10.0
+        
+        # Đếm số đường thoát của Ghost, số đường thoát càng nhiều thì trạng thái càng bất lợi cho Pacman
+        ghost_escape_routes = self._get_ghost_moves(ghost_pos, map_state)
+        score -= len(ghost_escape_routes) * 5.0
+        
+        return score
+
+    def _alpha_beta(self, depth: int, agent_index: int, pacman_pos: tuple, ghost_pos: tuple, alpha: float, beta: float, map_state: np.ndarray):
+        """
+        Thuật toán Minimax kết hợp Alpha-Beta Pruning.
+        agent_index = 0: Lượt của Pacman (Maximizer)
+        agent_index = 1: Lượt của Ghost (Minimizer)
+        """
+        # Điều kiện dừng: Hết độ sâu hoặc đã chạm vào Ghost
+        if depth == 0 or self._manhattan_distance(pacman_pos, ghost_pos) < 2:
+            return self._evaluation_function(pacman_pos, ghost_pos, map_state), None
+
+        if agent_index == 0:  # Lượt Pacman (Tối đa hóa điểm số)
+            v = float('-inf')
+            best_action = (Move.STAY, 1)
+            
+            for action in self._get_pacman_moves(pacman_pos, map_state):
+                m, steps = action
+                dr, dc = m.value
+                new_pacman_pos = (pacman_pos[0] + dr * steps, pacman_pos[1] + dc * steps)
+                
+                score, _ = self._alpha_beta(depth, 1, new_pacman_pos, ghost_pos, alpha, beta, map_state)
+                
+                if score > v:
+                    v = score
+                    best_action = action
+                    
+                alpha = max(alpha, v)
+                if alpha >= beta:
+                    break # Cắt tỉa Beta
+                    
+            return v, best_action
+            
+        else:  # Lượt Ghost (Tối thiểu hóa điểm số của Pacman)
+            v = float('inf')
+            
+            for action in self._get_ghost_moves(ghost_pos, map_state):
+                if action == Move.STAY:
+                    new_ghost_pos = ghost_pos
+                else:
+                    dr, dc = action.value
+                    new_ghost_pos = (ghost_pos[0] + dr, ghost_pos[1] + dc)
+                
+                score, _ = self._alpha_beta(depth - 1, 0, pacman_pos, new_ghost_pos, alpha, beta, map_state)
+                
+                if score < v:
+                    v = score
+                    
+                beta = min(beta, v)
+                if alpha >= beta:
+                    break # Cắt tỉa Alpha
+                    
+            return v, None
 
     def step(self, map_state: np.ndarray, my_position: tuple, enemy_position: tuple, step_number: int):
         if enemy_position is not None:
@@ -76,34 +149,29 @@ class PacmanAgent(BasePacmanAgent):
             
         target = enemy_position or self.last_known_enemy_pos
         
-        # Nếu không có thông tin kẻ địch -> Đi ngẫu nhiên để dò tìm [cite: 57]
+        # Nếu chưa có thông tin kẻ địch -> Đi dạo ngẫu nhiên (hoặc quét map)
         if target is None:
-            all_moves = [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT]
-            random.shuffle(all_moves)
-            for m in all_moves:
-                steps = self._max_valid_steps(my_position, m, map_state, self.pacman_speed)
-                if steps > 0:
-                    return (m, steps)
+            moves = self._get_pacman_moves(my_position, map_state)
+            if moves:
+                # Tránh trường hợp chỉ có Move.STAY
+                real_moves = [m for m in moves if m[0] != Move.STAY]
+                if real_moves:
+                    return random.choice(real_moves)
+                return moves[0]
             return (Move.STAY, 1)
 
-        # Sử dụng BFS để tìm hướng đi ngắn nhất đến vị trí Ghost
-        best_move = self._bfs_shortest_path(my_position, target, map_state)
+        # Chạy thuật toán Alpha-Beta để tìm nước đi tối ưu
+        _, best_move = self._alpha_beta(
+            depth=self.search_depth, 
+            agent_index=0, 
+            pacman_pos=my_position, 
+            ghost_pos=target, 
+            alpha=float('-inf'), 
+            beta=float('inf'), 
+            map_state=map_state
+        )
         
-        if best_move is not None:
-            # Di chuyển thẳng tối đa có thể theo hướng đó (lên tới giới hạn pacman_speed) [cite: 73, 82]
-            steps = self._max_valid_steps(my_position, best_move, map_state, self.pacman_speed)
-            if steps > 0:
-                return (best_move, steps) [cite: 80]
-                
-        # Phương án dự phòng nếu bị kẹt hoặc lỗi đồ thị
-        all_moves = [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT]
-        random.shuffle(all_moves)
-        for m in all_moves:
-            steps = self._max_valid_steps(my_position, m, map_state, 1)
-            if steps > 0:
-                return (m, steps) [cite: 80]
-                
-        return (Move.STAY, 1) [cite: 80]
+        return best_move
 
 
 class GhostAgent(BaseGhostAgent):
@@ -152,13 +220,13 @@ class GhostAgent(BaseGhostAgent):
             for m in all_moves:
                 dr, dc = m.value
                 if self._is_valid_position((my_position[0] + dr, my_position[1] + dc), map_state):
-                    return m [cite: 83]
-            return Move.STAY [cite: 83]
+                    return m
+            return Move.STAY
 
         # 1. Chạy BFS từ vị trí của Pacman để lấy khoảng cách thực tế đến mọi ô trống
         pacman_distances = self._compute_bfs_distances(threat, map_state)
         
-        best_move = Move.STAY [cite: 83]
+        best_move = Move.STAY
         # Khoảng cách hiện tại từ Pacman tới vị trí đứng của Ghost
         max_distance_from_enemy = pacman_distances.get(my_position, 0)
         
@@ -181,4 +249,4 @@ class GhostAgent(BaseGhostAgent):
                     max_distance_from_enemy = dist_from_enemy
                     best_move = move
                     
-        return best_move [cite: 83]
+        return best_move
