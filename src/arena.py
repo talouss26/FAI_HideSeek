@@ -8,6 +8,8 @@ import signal
 import sys
 import time
 import traceback
+import tracemalloc
+from environment import Move
 from pathlib import Path
 from typing import Optional, Tuple, Dict
 
@@ -293,18 +295,42 @@ class Arena:
         print(f"  Final Distance: {self.env.get_distance(self.env.pacman_pos, self.env.ghost_pos)}")
         print(f"\n{'='*60}\n")
 
-    def _run_agent_step(self, step_callable):
-        if not self.step_timeout or self.step_timeout <= 0:
-            return step_callable()
-
-        previous_handler = signal.getsignal(signal.SIGALRM)
+    def _run_agent_step(self, agent_fn):
+        """
+        Thực thi lượt đi của Agent qua hàm lambda, tích hợp bộ giám sát tài nguyên 
+        và cơ chế cô lập lỗi hệ thống nghiêm ngặt.
+        """
+        # Khởi động bộ đếm RAM độc lập cho lượt này
+        tracemalloc.start()
+        start_time = time.perf_counter()
+        
         try:
-            signal.signal(signal.SIGALRM, _agent_timeout_handler)
-            _start_alarm(self.step_timeout)
-            return step_callable()
+            # Gọi thực thi hàm step() của học sinh qua lambda
+            action = agent_fn()
+        except SystemExit:
+            # CHẶN ĐỨNG HÀNH VI TỰ HỦY: Chặn agent gọi sys.exit() phá hoại tiến trình giải đấu
+            raise Exception("Agent attempted to crash the arena using sys.exit().")
+        except Exception as e:
+            # Chuyển tiếp các lỗi runtime khác để Arena tự động xử thua
+            raise e
         finally:
-            _cancel_alarm()
-            signal.signal(signal.SIGALRM, previous_handler)
+            end_time = time.perf_counter()
+            # Trích xuất dung lượng RAM đỉnh (peak) tiêu thụ trong lượt
+            _, peak_mem = tracemalloc.get_traced_memory()
+            tracemalloc.stop()
+        
+        # Tính toán tài nguyên tiêu hao thực tế
+        execution_time = end_time - start_time
+        ram_consumed_mb = peak_mem / (1024 * 1024)
+        
+        # KIỂM TRA HẠN MỨC NGHIÊM NGẶT THEO YÊU CẦU ĐỒ ÁN
+        if execution_time > 1.0:
+            raise AgentTimeoutError(f"Time limit exceeded: {execution_time:.4f}s (Giới hạn: 1.0s)")
+            
+        if ram_consumed_mb > 128.0:
+            raise Exception(f"Memory limit exceeded: {ram_consumed_mb:.2f}MB (Giới hạn: 128MB)")
+            
+        return action
 
 
 def main():
